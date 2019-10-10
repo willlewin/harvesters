@@ -31,6 +31,8 @@ from urllib.parse import unquote
 import weakref
 import zipfile
 
+from PIL import Image
+
 # Related third party imports
 import numpy as np
 
@@ -191,11 +193,16 @@ class ThreadBase:
         """
         raise NotImplementedError
 
+    @property
     def is_running(self):
         """
         :return: :const:`True` if the worker is still running. Otherwise :const:`False`.
         """
         return self._is_running
+
+    @is_running.setter
+    def is_running(self, value):
+        self._is_running = value
 
     @property
     def worker(self):
@@ -392,7 +399,7 @@ class _ThreadImpl(Thread):
 
     def stop(self):
         with self._base.mutex:
-            self._base._is_running = False
+            self._base.is_running = False
 
     def run(self):
         """
@@ -401,7 +408,7 @@ class _ThreadImpl(Thread):
         This method will be terminated once its parent's is_running
         property turns False.
         """
-        while self._base._is_running:
+        while self._base.is_running:
             if self._worker:
                 self._worker()
                 time.sleep(self._sleep_duration)
@@ -1249,7 +1256,7 @@ class ImageAcquirer:
             self, *, parent=None, device=None,
             profiler=None, logger=None,
             sleep_duration=_sleep_duration_default,
-            file_path=None
+            file_path=None, save_path=None
     ):
         """
 
@@ -1259,6 +1266,7 @@ class ImageAcquirer:
         :param logger:
         :param sleep_duration:
         :param file_path: (Optional) Set a path to camera description file which you want to load on the target node map instead of the one which the device declares.
+        :param save_path: (Optional) Set a path to save images to when recording.
         """
 
         #
@@ -1374,7 +1382,11 @@ class ImageAcquirer:
         #
         self._has_acquired_1st_image = False
         self._is_acquiring_images = False
+        self._is_recording = False
         self._keep_latest = True
+
+        #
+        self.img_count = 0  # For naming saved images
 
         # Determine the default value:
         self._min_num_buffers = self._data_streams[0].buffer_announce_min
@@ -1400,6 +1412,13 @@ class ImageAcquirer:
 
         #
         self._finalizer = weakref.finalize(self, self._destroy)
+
+        self._save_path = save_path
+        if not save_path:
+            default_save_path = os.path.join(os.path.expanduser('~'), 'Harvesters')
+            if not os.path.exists(default_save_path):
+                os.mkdir(default_save_path)
+            self._save_path = default_save_path
 
     @staticmethod
     def _get_chunk_adapter(*, device=None):
@@ -1498,11 +1517,34 @@ class ImageAcquirer:
         """
         return self._system
 
+    @property
     def is_acquiring_images(self):
         """
         :return: :const:`True` if it's acquiring images. Otherwise :const:`False`.
         """
         return self._is_acquiring_images
+
+    @property
+    def is_recording(self):
+        """
+        :return: :const:`True` if it's saving all images. Otherwise :const:`False`.
+        """
+        return self._is_recording
+
+    @is_recording.setter
+    def is_recording(self, enable):
+        self._is_recording = enable
+
+    @property
+    def save_path(self):
+        """
+        :return: Absolute path to where images will be saved if recording.
+        """
+        return self._save_path
+
+    @save_path.setter
+    def save_path(self, path):
+        self._save_path = path
 
     @property
     def timeout_for_image_acquisition(self):
@@ -1667,7 +1709,7 @@ class ImageAcquirer:
     def _worker_image_acquisition(self):
         for event_manager in self._event_new_buffer_managers:
             try:
-                if self.is_acquiring_images():
+                if self.is_acquiring_images:
                     event_manager.update_event_data(
                         self._timeout_for_image_acquisition
                     )
@@ -1676,107 +1718,93 @@ class ImageAcquirer:
             except TimeoutException as e:
                 continue
             else:
-                # Check if the delivered buffer is complete:
-                if event_manager.buffer.is_complete():
-                    #
-                    if _is_logging_buffer_manipulation:
-                        self._logger.debug(
-                            'Acquired Buffer module #{0}'
-                            ' containing frame #{1}'
-                            ' from DataStream module {2}'
-                            ' of Device module {3}'
-                            '.'.format(
-                                event_manager.buffer.context,
-                                event_manager.buffer.frame_id,
-                                event_manager.parent.id_,
-                                event_manager.parent.parent.id_
-                            )
-                        )
-
-                    if self.keep_latest:
-                        # We want to keep the latest ones:
-                        with MutexLocker(self.thread_image_acquisition):
-                            if not self._is_acquiring_images:
-                                return
-
-                            if len(self._holding_filled_buffers) >= self._num_filled_buffers_to_hold:
-                                # Pick up the oldest one:
-                                buffer = self._holding_filled_buffers.pop(0)
-
-                                if _is_logging_buffer_manipulation:
-                                    self._logger.debug(
-                                        'Queued Buffer module #{0}'
-                                        ' containing frame #{1}'
-                                        ' to DataStream module {2}'
-                                        ' of Device module {3}'
-                                        '.'.format(
-                                            buffer.context,
-                                            buffer.frame_id,
-                                            buffer.parent.id_,
-                                            buffer.parent.parent.id_
-                                        )
-                                    )
-                                # Then discard/queue it:
-                                buffer.parent.queue_buffer(buffer)
-
-                        # Get the latest buffer:
-                        buffer = event_manager.buffer
-
-                        # Then append it to the list which the user fetches later:
-                        self._holding_filled_buffers.append(buffer)
-
-                        # Then update the statistics using the buffer:
-                        self._update_statistics(buffer)
-                    else:
-                        # Get the latest buffer:
-                        buffer = event_manager.buffer
-
-                        # Then update the statistics using the buffer:
-                        self._update_statistics(buffer)
-
-                        # We want to keep the oldest ones:
-                        with MutexLocker(self.thread_image_acquisition):
-                            if not self._is_acquiring_images:
-                                return
-
-                            if len(self._holding_filled_buffers) >= self._num_filled_buffers_to_hold:
-                                # We have not space to keep the latest one.
-                                # Discard/queue the latest buffer:
-                                buffer.parent.queue_buffer(buffer)
-                            else:
-                                # Just append it to the list:
-                                self._holding_filled_buffers.append(buffer)
-
-                    #
-                    if self._num_images_to_acquire >= 1:
-                        self._num_images_to_acquire -= 1
-
-                    if self._on_new_buffer_arrival:
-                        self._on_new_buffer_arrival()
-
-                    if self._num_images_to_acquire == 0:
-                        #
-                        if self.signal_stop_image_acquisition:
-                            self.signal_stop_image_acquisition.emit()
-
-                else:
-                    # Discard/queue the latest buffer when incomplete
+                #
+                if _is_logging_buffer_manipulation:
                     self._logger.debug(
-                        'Acquired buffer is complete: {0}'.format(
-                            event_manager.buffer.is_complete()
+                        'Acquired Buffer module #{0}'
+                        ' containing frame #{1}'
+                        ' from DataStream module {2}'
+                        ' of Device module {3}'
+                        '.'.format(
+                            event_manager.buffer.context,
+                            event_manager.buffer.frame_id,
+                            event_manager.parent.id_,
+                            event_manager.parent.parent.id_
                         )
                     )
-                    
-                    # Queue the incomplete buffer; we have nothing to do
-                    # with it:
-                    data_stream = event_manager.buffer.parent
-                    data_stream.queue_buffer(event_manager.buffer)
 
-                    #
+                if self.keep_latest:
+                    # We want to keep the latest ones:
                     with MutexLocker(self.thread_image_acquisition):
                         if not self._is_acquiring_images:
                             return
 
+                        if len(self._holding_filled_buffers) >= self._num_filled_buffers_to_hold:
+                            # Pick up the oldest one:
+                            buffer = self._holding_filled_buffers.pop(0)
+
+                            if _is_logging_buffer_manipulation:
+                                self._logger.debug(
+                                    'Queued Buffer module #{0}'
+                                    ' containing frame #{1}'
+                                    ' to DataStream module {2}'
+                                    ' of Device module {3}'
+                                    '.'.format(
+                                        buffer.context,
+                                        buffer.frame_id,
+                                        buffer.parent.id_,
+                                        buffer.parent.parent.id_
+                                    )
+                                )
+                            # Then discard/queue it:
+                            buffer.parent.queue_buffer(buffer)
+
+                    # Get the latest buffer:
+                    buffer = event_manager.buffer
+                    # Then append it to the list which the user fetches later:
+                    self._holding_filled_buffers.append(buffer)
+
+                    # Then update the statistics using the buffer:
+                    self._update_statistics(buffer)
+                else:
+                    # Get the latest buffer:
+                    buffer = event_manager.buffer
+
+                    # Then update the statistics using the buffer:
+                    self._update_statistics(buffer)
+
+                    # We want to keep the oldest ones:
+                    with MutexLocker(self.thread_image_acquisition):
+                        if not self._is_acquiring_images:
+                            return
+
+                        if len(self._holding_filled_buffers) >= self._num_filled_buffers_to_hold:
+                            # We have not space to keep the latest one.
+                            # Discard/queue the latest buffer:
+                            buffer.parent.queue_buffer(buffer)
+                        else:
+                            # Just append it to the list:
+                            self._holding_filled_buffers.append(buffer)
+
+            #
+            if self._num_images_to_acquire >= 1:
+                self._num_images_to_acquire -= 1
+
+            if self._on_new_buffer_arrival:
+                self._on_new_buffer_arrival()
+
+            if self._num_images_to_acquire == 0:
+                #
+                if self.signal_stop_image_acquisition:
+                    self.signal_stop_image_acquisition.emit()
+
+            #   Save to disk
+            if self.is_recording and 'buffer' in locals():
+                image = Image.frombytes("L", (buffer.width, buffer.height), buffer.raw_buffer)
+                file_name = time.strftime("[%Y.%m.%d]_[%H.%M.%S]" + "Image" + str(self.img_count) + '.bmp')
+                file_name = os.path.join(self.save_path, file_name)
+                image.save(file_name, format='bmp')
+                self.img_count += 1
 
     def _update_chunk_data(self, buffer=None):
         try:
@@ -1837,7 +1865,7 @@ class ImageAcquirer:
 
         :return: A :class:`Buffer` object.
         """
-        if not self.is_acquiring_images():
+        if not self.is_acquiring_images:
             raise TimeoutException
 
         watch_timeout = True if timeout > 0 else False
@@ -1972,12 +2000,12 @@ class ImageAcquirer:
 
         :return: None.
         """
-        if self.is_acquiring_images():
+        if self.is_acquiring_images:
             #
             self._is_acquiring_images = False
 
             #
-            if self.thread_image_acquisition.is_running():  # TODO
+            if self.thread_image_acquisition.is_running:  # TODO
                 self.thread_image_acquisition.stop()
 
             with MutexLocker(self.thread_image_acquisition):
